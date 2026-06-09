@@ -1,212 +1,423 @@
 import Flutter
-import CoreMIDI
-import AVFAudio
+import UIKit
 import AVFoundation
-import CoreAudio
 
 public class FlutterMidiProPlugin: NSObject, FlutterPlugin {
-  var audioEngines: [Int: [AVAudioEngine]] = [:]
-  var soundfontIndex = 1
-  var soundfontSamplers: [Int: [AVAudioUnitSampler]] = [:]
-  var soundfontURLs: [Int: URL] = [:]
-  
+  private final class SoundFontState {
+    let url: URL
+    let engine: AVAudioEngine
+    var samplersByChannel: [Int: AVAudioUnitSampler] = [:]
+
+    init(url: URL) {
+      self.url = url
+      self.engine = AVAudioEngine()
+    }
+  }
+
+  private let audioQueue = DispatchQueue(
+    label: "com.oneonone.flutter_midi_pro.audio",
+    qos: .userInitiated
+  )
+
+  private var soundfonts: [Int: SoundFontState] = [:]
+  private var nextSoundfontId = 1
+
   public static func register(with registrar: FlutterPluginRegistrar) {
-    let channel = FlutterMethodChannel(name: "flutter_midi_pro", binaryMessenger: registrar.messenger())
+    let channel = FlutterMethodChannel(
+      name: "flutter_midi_pro",
+      binaryMessenger: registrar.messenger()
+    )
+
     let instance = FlutterMidiProPlugin()
     registrar.addMethodCallDelegate(instance, channel: channel)
-  }
-  
-  public override init() {
-    super.init()
-    setupAudioSessionNotifications()
-  }
-  
-  deinit {
-    NotificationCenter.default.removeObserver(self)
-  }
-  
-  private func setupAudioSessionNotifications() {
-    NotificationCenter.default.addObserver(
-      self,
-      selector: #selector(handleAudioSessionInterruption),
-      name: AVAudioSession.interruptionNotification,
-      object: AVAudioSession.sharedInstance()
-    )
-  }
-  
-  @objc private func handleAudioSessionInterruption(notification: Notification) {
-    guard let userInfo = notification.userInfo,
-          let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
-          let type = AVAudioSession.InterruptionType(rawValue: typeValue) else {
-      return
-    }
-    
-    switch type {
-    case .began:
-      // Interruption began - audio engines will be stopped automatically by the system
-      break
-    case .ended:
-      // Interruption ended - restart all audio engines
-      // Check if we should resume (if option is present and true, or if option is missing)
-      var shouldResume = true
-      if let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt {
-        let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
-        shouldResume = options.contains(.shouldResume)
-      }
-      
-      if shouldResume {
-        restartAudioEngines()
-      }
-    @unknown default:
-      break
-    }
-  }
-  
-  private func restartAudioEngines() {
-    for (sfId, engines) in audioEngines {
-      for (index, engine) in engines.enumerated() {
-        if !engine.isRunning {
-          do {
-            try engine.start()
-          } catch {
-            print("Failed to restart audio engine for sfId \(sfId), channel \(index): \(error)")
-          }
-        }
-      }
-    }
   }
 
   public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     switch call.method {
     case "loadSoundfont":
-        let args = call.arguments as! [String: Any]
-        let path = args["path"] as! String
-        let bank = args["bank"] as! Int
-        let program = args["program"] as! Int
-        let url = URL(fileURLWithPath: path)
-        var chSamplers: [AVAudioUnitSampler] = []
-        var chAudioEngines: [AVAudioEngine] = []
-        for _ in 0...15 {
-            let sampler = AVAudioUnitSampler()
-            let audioEngine = AVAudioEngine()
-            audioEngine.attach(sampler)
-            audioEngine.connect(sampler, to: audioEngine.mainMixerNode, format:nil)
-            do {
-                try audioEngine.start()
-            } catch {
-                result(FlutterError(code: "AUDIO_ENGINE_START_FAILED", message: "Failed to start audio engine", details: nil))
-                return
-            }
-            do {
-                let isPercussion = (bank == 128)
-                let bankMSB: UInt8 = isPercussion ? UInt8(kAUSampler_DefaultPercussionBankMSB) : UInt8(kAUSampler_DefaultMelodicBankMSB)
-                let bankLSB: UInt8 = isPercussion ? 0 : UInt8(bank)
-                
-                try sampler.loadSoundBankInstrument(at: url, program: UInt8(program), bankMSB: bankMSB, bankLSB: bankLSB)
-            } catch {
-                result(FlutterError(code: "SOUND_FONT_LOAD_FAILED1", message: "Failed to load soundfont", details: nil))
-                return
-            }
-            chSamplers.append(sampler)
-            chAudioEngines.append(audioEngine)
-        }
-        soundfontSamplers[soundfontIndex] = chSamplers
-        soundfontURLs[soundfontIndex] = url
-        audioEngines[soundfontIndex] = chAudioEngines
-        soundfontIndex += 1
-        result(soundfontIndex-1)
-    case "stopAllNotes":
-        let args = call.arguments as! [String: Any]
-        let sfId = args["sfId"] as! Int
-        let soundfontSampler = soundfontSamplers[sfId]
-        if soundfontSampler == nil {
-            result(FlutterError(code: "SOUND_FONT_NOT_FOUND", message: "Soundfont not found", details: nil))
-            return
-        }
-        soundfontSampler!.forEach { (sampler) in
-            // Sustain'i kapat (CC 64 -> 0) ve anında sesi kes (All Sound Off, CC 120 -> 0)
-            for channel in 0...15 {
-                sampler.sendController(64, withValue: 0, onChannel: UInt8(channel))
-                sampler.sendController(120, withValue: 0, onChannel: UInt8(channel))
-            }
-        }
-        result(nil)
-    case "controlChange":
-        let args = call.arguments as! [String: Any]
-        let sfId = args["sfId"] as! Int
-        let channel = args["channel"] as! Int
-        let controller = args["controller"] as! Int
-        let value = args["value"] as! Int
-        guard let sampler = soundfontSamplers[sfId]?[channel] else {
-            result(FlutterError(code: "SOUND_FONT_NOT_FOUND", message: "Soundfont/channel not found", details: nil))
-            return
-        }
-        sampler.sendController(UInt8(controller), withValue: UInt8(value), onChannel: UInt8(channel))
-        result(nil)
+      loadSoundfont(call, result: result)
+
     case "selectInstrument":
-        let args = call.arguments as! [String: Any]
-        let sfId = args["sfId"] as! Int
-        let channel = args["channel"] as! Int
-        let bank = args["bank"] as! Int
-        let program = args["program"] as! Int
-        let soundfontSampler = soundfontSamplers[sfId]![channel]
-        let soundfontUrl = soundfontURLs[sfId]!
-        do {
-            let isPercussion = (bank == 128)
-            let bankMSB: UInt8 = isPercussion ? UInt8(kAUSampler_DefaultPercussionBankMSB) : UInt8(kAUSampler_DefaultMelodicBankMSB)
-            let bankLSB: UInt8 = isPercussion ? 0 : UInt8(bank)
-            
-            try soundfontSampler.loadSoundBankInstrument(at: soundfontUrl, program: UInt8(program), bankMSB: bankMSB, bankLSB: bankLSB)
-        } catch {
-            result(FlutterError(code: "SOUND_FONT_LOAD_FAILED2", message: "Failed to load soundfont", details: nil))
-            return
-        }
-        soundfontSampler.sendProgramChange(UInt8(program), bankMSB: UInt8(kAUSampler_DefaultMelodicBankMSB), bankLSB: UInt8(bank), onChannel: UInt8(channel))
-        result(nil)
+      selectInstrument(call, result: result)
+
     case "playNote":
-        let args = call.arguments as! [String: Any]
-        let channel = args["channel"] as! Int
-        let note = args["key"] as! Int
-        let velocity = args["velocity"] as! Int
-        let sfId = args["sfId"] as! Int
-        let soundfontSampler = soundfontSamplers[sfId]![channel]
-        soundfontSampler.startNote(UInt8(note), withVelocity: UInt8(velocity), onChannel: UInt8(channel))
-        result(nil)
+      playNote(call, result: result)
+
     case "stopNote":
-        let args = call.arguments as! [String: Any]
-        let channel = args["channel"] as! Int
-        let note = args["key"] as! Int
-        let sfId = args["sfId"] as! Int
-        let soundfontSampler = soundfontSamplers[sfId]![channel]
-        soundfontSampler.stopNote(UInt8(note), onChannel: UInt8(channel))
-        result(nil)
+      stopNote(call, result: result)
+
+    case "stopAllNotes":
+      stopAllNotes(call, result: result)
+
+    case "controlChange":
+      controlChange(call, result: result)
+
     case "unloadSoundfont":
-        let args = call.arguments as! [String:Any]
-        let sfId = args["sfId"] as! Int
-        let soundfontSampler = soundfontSamplers[sfId]
-        if soundfontSampler == nil {
-            result(FlutterError(code: "SOUND_FONT_NOT_FOUND", message: "Soundfont not found", details: nil))
-            return
-        }
-        audioEngines[sfId]?.forEach { (audioEngine) in
-            audioEngine.stop()
-        }
-        audioEngines.removeValue(forKey: sfId)
-        soundfontSamplers.removeValue(forKey: sfId)
-        soundfontURLs.removeValue(forKey: sfId)
-        result(nil)
+      unloadSoundfont(call, result: result)
+
     case "dispose":
-        audioEngines.forEach { (key, value) in
-            value.forEach { (audioEngine) in
-                audioEngine.stop()
-            }
-        }
-        audioEngines = [:]
-        soundfontSamplers = [:]
-        result(nil)
+      dispose(result: result)
+
     default:
       result(FlutterMethodNotImplemented)
-        break
+    }
+  }
+
+  // MARK: - Public method handlers
+
+  private func loadSoundfont(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard
+      let args = call.arguments as? [String: Any],
+      let path = args["path"] as? String,
+      let bank = args["bank"] as? Int,
+      let program = args["program"] as? Int
+    else {
+      result(badArgs("Invalid loadSoundfont args"))
+      return
+    }
+
+    audioQueue.async {
+      do {
+        let url = URL(fileURLWithPath: path)
+        let state = SoundFontState(url: url)
+
+        // Compatibility behavior: prepare channel 0 only.
+        // The original plugin eagerly prepared all 16 channels; this fork does not.
+        let sampler = try self.sampler(for: state, channel: 0)
+        try self.loadInstrument(
+          sampler: sampler,
+          url: url,
+          bank: bank,
+          program: program,
+          channel: 0
+        )
+
+        let sfId = self.nextSoundfontId
+        self.nextSoundfontId += 1
+        self.soundfonts[sfId] = state
+
+        DispatchQueue.main.async {
+          result(sfId)
+        }
+      } catch {
+        DispatchQueue.main.async {
+          result(FlutterError(
+            code: "SOUND_FONT_LOAD_FAILED",
+            message: "Failed to load soundfont",
+            details: [
+              "path": path,
+              "fileExists": FileManager.default.fileExists(atPath: path),
+              "error": error.localizedDescription
+            ]
+          ))
+        }
+      }
+    }
+  }
+
+  private func selectInstrument(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard
+      let args = call.arguments as? [String: Any],
+      let sfId = args["sfId"] as? Int,
+      let channel = args["channel"] as? Int,
+      let bank = args["bank"] as? Int,
+      let program = args["program"] as? Int
+    else {
+      result(badArgs("Invalid selectInstrument args"))
+      return
+    }
+
+    audioQueue.async {
+      do {
+        guard let state = self.soundfonts[sfId] else {
+          throw PluginError.soundfontNotFound(sfId)
+        }
+
+        let sampler = try self.sampler(for: state, channel: channel)
+        try self.loadInstrument(
+          sampler: sampler,
+          url: state.url,
+          bank: bank,
+          program: program,
+          channel: channel
+        )
+
+        DispatchQueue.main.async {
+          result(nil)
+        }
+      } catch {
+        DispatchQueue.main.async {
+          result(FlutterError(
+            code: "SELECT_INSTRUMENT_FAILED",
+            message: "Failed to select instrument",
+            details: [
+              "sfId": sfId,
+              "channel": channel,
+              "bank": bank,
+              "program": program,
+              "error": error.localizedDescription
+            ]
+          ))
+        }
+      }
+    }
+  }
+
+  private func playNote(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard
+      let args = call.arguments as? [String: Any],
+      let sfId = args["sfId"] as? Int,
+      let channel = args["channel"] as? Int,
+      let key = args["key"] as? Int,
+      let velocity = args["velocity"] as? Int
+    else {
+      result(badArgs("Invalid playNote args"))
+      return
+    }
+
+    audioQueue.async {
+      guard let sampler = self.soundfonts[sfId]?.samplersByChannel[channel] else {
+        DispatchQueue.main.async {
+          result(FlutterError(
+            code: "CHANNEL_NOT_LOADED",
+            message: "No sampler loaded for channel",
+            details: ["sfId": sfId, "channel": channel]
+          ))
+        }
+        return
+      }
+
+      sampler.startNote(
+        UInt8(clamping: key),
+        withVelocity: UInt8(clamping: velocity),
+        onChannel: UInt8(clamping: channel)
+      )
+
+      DispatchQueue.main.async {
+        result(nil)
+      }
+    }
+  }
+
+  private func stopNote(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard
+      let args = call.arguments as? [String: Any],
+      let sfId = args["sfId"] as? Int,
+      let channel = args["channel"] as? Int,
+      let key = args["key"] as? Int
+    else {
+      result(badArgs("Invalid stopNote args"))
+      return
+    }
+
+    audioQueue.async {
+      let sampler = self.soundfonts[sfId]?.samplersByChannel[channel]
+
+      sampler?.stopNote(
+        UInt8(clamping: key),
+        onChannel: UInt8(clamping: channel)
+      )
+
+      DispatchQueue.main.async {
+        result(nil)
+      }
+    }
+  }
+
+  private func stopAllNotes(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard
+      let args = call.arguments as? [String: Any],
+      let sfId = args["sfId"] as? Int
+    else {
+      result(badArgs("Invalid stopAllNotes args"))
+      return
+    }
+
+    audioQueue.async {
+      guard let state = self.soundfonts[sfId] else {
+        DispatchQueue.main.async {
+          result(nil)
+        }
+        return
+      }
+
+      for (channel, sampler) in state.samplersByChannel {
+        let midiChannel = UInt8(clamping: channel)
+
+        // 64 = sustain off, 120 = all sound off, 123 = all notes off.
+        sampler.sendController(64, withValue: 0, onChannel: midiChannel)
+        sampler.sendController(120, withValue: 0, onChannel: midiChannel)
+        sampler.sendController(123, withValue: 0, onChannel: midiChannel)
+      }
+
+      DispatchQueue.main.async {
+        result(nil)
+      }
+    }
+  }
+
+  private func controlChange(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard
+      let args = call.arguments as? [String: Any],
+      let sfId = args["sfId"] as? Int,
+      let channel = args["channel"] as? Int,
+      let controller = args["controller"] as? Int,
+      let value = args["value"] as? Int
+    else {
+      result(badArgs("Invalid controlChange args"))
+      return
+    }
+
+    audioQueue.async {
+      guard let sampler = self.soundfonts[sfId]?.samplersByChannel[channel] else {
+        DispatchQueue.main.async {
+          result(FlutterError(
+            code: "CHANNEL_NOT_LOADED",
+            message: "No sampler loaded for channel",
+            details: ["sfId": sfId, "channel": channel]
+          ))
+        }
+        return
+      }
+
+      sampler.sendController(
+        UInt8(clamping: controller),
+        withValue: UInt8(clamping: value),
+        onChannel: UInt8(clamping: channel)
+      )
+
+      DispatchQueue.main.async {
+        result(nil)
+      }
+    }
+  }
+
+  private func unloadSoundfont(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard
+      let args = call.arguments as? [String: Any],
+      let sfId = args["sfId"] as? Int
+    else {
+      result(badArgs("Invalid unloadSoundfont args"))
+      return
+    }
+
+    audioQueue.async {
+      if let state = self.soundfonts[sfId] {
+        for (channel, sampler) in state.samplersByChannel {
+          let midiChannel = UInt8(clamping: channel)
+          sampler.sendController(64, withValue: 0, onChannel: midiChannel)
+          sampler.sendController(120, withValue: 0, onChannel: midiChannel)
+          sampler.sendController(123, withValue: 0, onChannel: midiChannel)
+        }
+
+        state.engine.stop()
+        self.soundfonts.removeValue(forKey: sfId)
+      }
+
+      DispatchQueue.main.async {
+        result(nil)
+      }
+    }
+  }
+
+  private func dispose(result: @escaping FlutterResult) {
+    audioQueue.async {
+      for (_, state) in self.soundfonts {
+        state.engine.stop()
+      }
+
+      self.soundfonts.removeAll()
+
+      DispatchQueue.main.async {
+        result(nil)
+      }
+    }
+  }
+
+  // MARK: - Audio helpers
+
+  private func sampler(
+    for state: SoundFontState,
+    channel: Int
+  ) throws -> AVAudioUnitSampler {
+    if let existing = state.samplersByChannel[channel] {
+      return existing
+    }
+
+    let sampler = AVAudioUnitSampler()
+
+    state.engine.attach(sampler)
+    state.engine.connect(
+      sampler,
+      to: state.engine.mainMixerNode,
+      format: nil
+    )
+
+    state.samplersByChannel[channel] = sampler
+
+    if !state.engine.isRunning {
+      try state.engine.start()
+    }
+
+    return sampler
+  }
+
+  private func loadInstrument(
+    sampler: AVAudioUnitSampler,
+    url: URL,
+    bank: Int,
+    program: Int,
+    channel: Int
+  ) throws {
+    let bankValues = resolvedBankValues(bank: bank)
+
+    try sampler.loadSoundBankInstrument(
+      at: url,
+      program: UInt8(clamping: program),
+      bankMSB: bankValues.msb,
+      bankLSB: bankValues.lsb
+    )
+
+    sampler.sendProgramChange(
+      UInt8(clamping: program),
+      bankMSB: bankValues.msb,
+      bankLSB: bankValues.lsb,
+      onChannel: UInt8(clamping: channel)
+    )
+  }
+
+  private func resolvedBankValues(bank: Int) -> (msb: UInt8, lsb: UInt8) {
+    if bank == 128 {
+      return (
+        UInt8(kAUSampler_DefaultPercussionBankMSB),
+        0
+      )
+    }
+
+    return (
+      UInt8(kAUSampler_DefaultMelodicBankMSB),
+      UInt8(clamping: bank)
+    )
+  }
+
+  // MARK: - Errors
+
+  private func badArgs(_ message: String) -> FlutterError {
+    FlutterError(
+      code: "BAD_ARGS",
+      message: message,
+      details: nil
+    )
+  }
+
+  private enum PluginError: LocalizedError {
+    case soundfontNotFound(Int)
+
+    var errorDescription: String? {
+      switch self {
+      case .soundfontNotFound(let sfId):
+        return "Soundfont not found: \(sfId)"
+      }
     }
   }
 }
